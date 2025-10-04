@@ -281,15 +281,23 @@ function App() {
     } catch (error) {
       console.error("Auto-generation error:", error);
       let errorMessage = "Unknown error occurred";
-      
+
       if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
+        if (typeof error.response.data.detail === 'string') {
+          errorMessage = error.response.data.detail;
+        } else if (Array.isArray(error.response.data.detail)) {
+          errorMessage = error.response.data.detail.map(err =>
+            typeof err === 'string' ? err : (err.msg || JSON.stringify(err))
+          ).join(', ');
+        } else {
+          errorMessage = JSON.stringify(error.response.data.detail);
+        }
       } else if (error.response?.data?.message) {
         errorMessage = error.response.data.message;
       } else if (error.message) {
         errorMessage = error.message;
       }
-      
+
       toast.error(`Failed to start auto-generation: ${errorMessage}`);
       setIsAutoGenerating(false);
     }
@@ -354,27 +362,30 @@ function App() {
 
   const calculateQuestionsPerTopic = (topics, totalQuestions) => {
     const totalWeightage = topics.reduce((sum, topic) => sum + (topic.weightage || 0), 0);
-    
+
     if (totalWeightage === 0) {
-      // If no weightage, distribute equally
-      const questionsPerTopic = Math.max(1, Math.floor(totalQuestions / topics.length));
+      // If no weightage, give at least 1 question to each topic
       return topics.map(topic => ({
         ...topic,
-        estimated_questions: questionsPerTopic
+        estimated_questions: 1
       }));
     }
 
     // Distribute based on weightage
-    let remaining = totalQuestions;
-    const result = topics.map((topic, index) => {
-      if (index === topics.length - 1) {
-        // Last topic gets remaining questions
-        return { ...topic, estimated_questions: remaining };
-      } else {
-        const topicQuestions = Math.max(1, Math.round((topic.weightage || 0) / 100 * totalQuestions));
-        remaining -= topicQuestions;
-        return { ...topic, estimated_questions: topicQuestions };
+    const result = topics.map((topic) => {
+      const weightage = topic.weightage || 0;
+
+      if (weightage === 0) {
+        // Topics with 0% weightage still get 1 good question
+        return { ...topic, estimated_questions: 1 };
       }
+
+      // Calculate questions based on percentage of total
+      const exactQuestions = (weightage / 100) * totalQuestions;
+      // Round up to ensure we generate enough questions (user is okay with generating more)
+      const topicQuestions = Math.ceil(exactQuestions);
+
+      return { ...topic, estimated_questions: topicQuestions };
     });
 
     return result;
@@ -396,23 +407,20 @@ function App() {
   };
 
   const generatePYQSolutionForTopic = async (topicId) => {
-    // Get existing PYQ questions for this topic
-    const existingResponse = await axios.get(`${API}/existing-questions/${topicId}`);
-    const existingQuestions = existingResponse.data;
-    
-    if (existingQuestions.length === 0) {
-      return null; // Skip if no PYQ questions available
+    // Get existing PYQ questions for this topic from questions_topic_wise table
+    const existingResponse = await axios.get(`${API}/pyq-questions-without-solution/${topicId}`);
+    const questionsWithoutSolution = existingResponse.data;
+
+    if (questionsWithoutSolution.length === 0) {
+      return null; // Skip if no PYQ questions available without solution
     }
 
-    // Pick a random question that doesn't have a solution yet
-    const questionWithoutSolution = existingQuestions.find(q => !q.solution || q.solution.trim() === '');
-    
-    if (!questionWithoutSolution) {
-      return null; // Skip if all questions already have solutions
-    }
+    // Pick the first question that doesn't have a solution
+    const questionWithoutSolution = questionsWithoutSolution[0];
 
     // Generate solution for the PYQ
     const response = await axios.post(`${API}/generate-pyq-solution`, {
+      question_id: questionWithoutSolution.id,
       topic_id: topicId,
       question_statement: questionWithoutSolution.question_statement,
       options: questionWithoutSolution.options,

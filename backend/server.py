@@ -96,6 +96,7 @@ class TopicResponse(BaseModel):
     name: str
     description: Optional[str] = None
     weightage: Optional[float] = None
+    notes: Optional[str] = None
 
 class PartResponse(BaseModel):
     id: str
@@ -160,6 +161,7 @@ class TopicWithWeightage(BaseModel):
     id: str
     name: str
     weightage: Optional[float] = None
+    notes: Optional[str] = None
     chapter_id: str
     chapter_name: str
     unit_id: str
@@ -178,6 +180,7 @@ class AutoGenerationProgress(BaseModel):
     can_pause: bool = True
 
 class PYQSolutionRequest(BaseModel):
+    question_id: str
     topic_id: str
     question_statement: str
     options: Optional[List[str]] = None
@@ -276,6 +279,22 @@ async def get_existing_questions(topic_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching existing questions: {str(e)}")
 
+@api_router.get("/pyq-questions-without-solution/{topic_id}")
+async def get_pyq_questions_without_solution(topic_id: str):
+    """Get PYQ questions for a topic that don't have solutions yet"""
+    try:
+        result = supabase.table("questions_topic_wise").select("id, question_statement, options, answer, solution, question_type").eq("topic_id", topic_id).execute()
+
+        # Filter questions without solution
+        questions_without_solution = [
+            q for q in result.data
+            if not q.get('solution') or q.get('solution', '').strip() == ''
+        ]
+
+        return questions_without_solution
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching PYQ questions without solution: {str(e)}")
+
 @api_router.get("/generated-questions/{topic_id}")
 async def get_generated_questions(topic_id: str):
     """Get previously generated questions for a topic"""
@@ -338,6 +357,7 @@ async def get_all_topics_with_weightage(course_id: str):
                             id=topic["id"],
                             name=topic["name"],
                             weightage=topic.get("weightage", 0.0),
+                            notes=topic.get("notes", ""),
                             chapter_id=chapter["id"],
                             chapter_name=chapter["name"],
                             unit_id=unit["id"],
@@ -360,20 +380,22 @@ async def create_auto_generation_session(config: AutoGenerationConfig, exam_id: 
         # Calculate questions per topic based on weightage
         total_weightage = sum(topic.weightage or 0 for topic in topics)
         if total_weightage == 0:
-            # If no weightage, distribute equally
-            questions_per_topic = max(1, config.total_questions // len(topics)) if topics else 0
+            # If no weightage, give at least 1 question to each topic
             for topic in topics:
-                topic.estimated_questions = questions_per_topic
+                topic.estimated_questions = 1
         else:
             # Distribute based on weightage
-            remaining_questions = config.total_questions
-            for i, topic in enumerate(topics):
-                if i == len(topics) - 1:  # Last topic gets remaining questions
-                    topic.estimated_questions = remaining_questions
+            for topic in topics:
+                weightage = topic.weightage or 0
+
+                if weightage == 0:
+                    # Topics with 0% weightage still get 1 good question
+                    topic.estimated_questions = 1
                 else:
-                    topic_questions = max(1, int((topic.weightage or 0) / 100 * config.total_questions))
-                    topic.estimated_questions = topic_questions
-                    remaining_questions -= topic_questions
+                    # Calculate questions based on percentage of total
+                    exact_questions = (weightage / 100) * config.total_questions
+                    # Round up to ensure we generate enough questions (user is okay with generating more)
+                    topic.estimated_questions = max(1, int(exact_questions + 0.5))
         
         session_id = str(uuid.uuid4())
         session = AutoGenerationSession(
@@ -407,8 +429,11 @@ async def generate_pyq_solution(request: PYQSolutionRequest):
         # Get chapter and course information for better context
         chapter_result = supabase.table("chapters").select("*").eq("id", topic["chapter_id"]).execute()
         chapter = chapter_result.data[0] if chapter_result.data else {}
-        
-        # Create prompt for Gemini to solve the PYQ
+
+        # Get notes for the topic
+        topic_notes = topic.get('notes', '')
+
+        # Create prompt for Gemini to solve the PYQ using topic notes
         prompt = f"""
 You are an expert educator and question solver. Analyze the following previous year question and provide the correct answer and detailed solution.
 
@@ -416,25 +441,32 @@ Topic: {topic['name']}
 Chapter: {chapter.get('name', '')}
 Question Type: {request.question_type}
 
+IMPORTANT CONTEXT - Study Notes from this Chapter:
+{topic_notes if topic_notes else "No specific notes available for this topic."}
+
+Use the concepts from these notes to solve the question. Your solution should reference and apply the principles mentioned in the notes.
+
 Question: {request.question_statement}
 
 {f'Options: {request.options}' if request.options else ''}
 
 Your task:
-1. Carefully analyze the question and determine the correct answer
-2. Provide a step-by-step solution explaining the reasoning
-3. Double-check your work to ensure accuracy
+1. Carefully analyze the question using the concepts from the provided notes
+2. Determine the correct answer based on the principles in the notes
+3. Provide a step-by-step solution that references the relevant concepts from the notes
+4. Double-check your work to ensure accuracy
 
 Requirements:
 - For MCQ: Provide the correct option index (0-3)
 - For MSQ: Provide comma-separated correct option indices
 - For NAT: Provide the numerical answer
 - For SUB: Provide a comprehensive answer
+- Always reference the relevant concepts from the notes in your solution
 
 Respond in the following JSON format:
 {{
     "answer": "Your answer here (following the format rules above)",
-    "solution": "Detailed step-by-step solution with clear explanations",
+    "solution": "Detailed step-by-step solution with clear explanations, referencing concepts from the notes",
     "confidence_level": "High/Medium/Low - your confidence in this solution"
 }}
 """
@@ -495,7 +527,20 @@ Respond in the following JSON format:
             solution=solution_data.get("solution", ""),
             confidence_level=solution_data.get("confidence_level", "Medium")
         )
-        
+
+        # Update the question in questions_topic_wise table with the generated solution
+        try:
+            update_data = {
+                "answer": solution_data.get("answer", ""),
+                "solution": solution_data.get("solution", ""),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            supabase.table("questions_topic_wise").update(update_data).eq("id", request.question_id).execute()
+        except Exception as update_error:
+            # Log the error but don't fail the entire request
+            print(f"Warning: Failed to update question with solution: {str(update_error)}")
+
         return pyq_solution
         
     except HTTPException:

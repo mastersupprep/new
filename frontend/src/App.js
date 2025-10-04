@@ -5,7 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
 import { Badge } from "./components/ui/badge";
 import { Separator } from "./components/ui/separator";
-import { Loader2, Sparkles, BookOpen, GraduationCap, Play, Pause, Square } from "lucide-react";
+import { Loader as Loader2, Sparkles, BookOpen, GraduationCap, Play, Pause, Square } from "lucide-react";
 import { Toaster, toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
